@@ -11,3 +11,5 @@ python3 /absolute/InfiniLM-MiniMax-H3/competition/build_from_git.py extension
 ```
 
 This uses the same source-driven build adapter as Core, offline pybind/xmake dependencies, vendor Torch CXX11 ABI and a private installation prefix. It does not change weights or reference scoring. Existing evidence proves selected source hashes, a prior isolated library rebuild and one full H3 first-forward. Qwen output parity, full quality, clean-system setup and consecutive-case validation remain incomplete. New public Git adapter rebuild has not run on GPU here; do not label this source publication as new runtime acceptance.
+
+Offline dependency gate: xmake-repo-cache.tar.gz uses the archived toolchain-v2 snapshot SHA256802f2a0839e2d98f7679712df573cd681a9494b768cce38337ebbcb3a5d39984; pybind11-v3.1.0.zip SHA256affea1ada7b39fe1d835559fcb78800c7927d514bd480ed01b71b88205a5e536. A different cache fails before extraction; do not silently substitute another recipe snapshot.
