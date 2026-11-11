@@ -5,7 +5,35 @@
 #include "infinicore/ops/per_tensor_dequant_i8.hpp"
 #include "infinicore/ops/per_tensor_quant_i8.hpp"
 
+#include <infinicore/context/context.hpp>
+
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
 namespace infinilm::layers::attention::backends {
+namespace {
+
+int32_t read_i32_scalar(const infinicore::Tensor &tensor,
+                        const char *name) {
+    if (tensor->dtype() != infinicore::DataType::I32
+        || tensor->numel() < 1
+        || !tensor->is_contiguous()) {
+        throw std::invalid_argument(
+            std::string(name) + " must be a contiguous nonempty int32 tensor");
+    }
+    int32_t value = 0;
+    if (tensor->device().getType() == infinicore::Device::Type::CPU) {
+        std::memcpy(&value, tensor->data(), sizeof(value));
+    } else {
+        infinicore::context::setDevice(tensor->device());
+        infinicore::context::memcpyD2H(
+            &value, tensor->data(), sizeof(value));
+    }
+    return value;
+}
+
+} // namespace
 
 StaticAttentionImpl::StaticAttentionImpl(size_t num_heads,
                                          size_t head_size,
@@ -64,7 +92,9 @@ infinicore::Tensor StaticAttentionImpl::forward(const AttentionLayer &layer,
                           ->contiguous()
                           ->view({batch_size, seq_len, num_heads_ * value_head_dim}); // [bs, seq_len, n_q_head * value_head_dim]
     } else {
-        size_t total_seq_len = reinterpret_cast<int32_t *>(total_sequence_lengths.value()->to(infinicore::Device::cpu())->data())[0];
+        size_t total_seq_len = static_cast<size_t>(
+            read_i32_scalar(total_sequence_lengths.value(),
+                            "total_sequence_lengths"));
 
         if (infinilm::quantization::KVQuantAlgo::NONE != this->kv_quant_scheme_) {
             infinilm::KVQuantUtils::dequantize(
@@ -119,7 +149,8 @@ std::tuple<infinicore::Tensor, infinicore::Tensor> StaticAttentionImpl::do_kv_ca
 
     ASSERT_EQ(batch_size, max_batch_size);
 
-    size_t cache_pos = reinterpret_cast<int32_t *>(past_sequence_lengths->to(infinicore::Device::cpu())->data())[0];
+    size_t cache_pos = static_cast<size_t>(
+        read_i32_scalar(past_sequence_lengths, "past_sequence_lengths"));
     auto result_len = cache_pos + update_len;
     ASSERT(result_len <= max_seq_len);
 

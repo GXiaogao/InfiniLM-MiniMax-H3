@@ -1,4 +1,5 @@
 #include "rank_worker.hpp"
+#include "h3_weight_load_sync.hpp"
 #include "../models/model_factory.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/distributed/send_recv.hpp"
@@ -348,7 +349,8 @@ void RankWorker::thread_loop() {
             // Execute job outside the lock
             if (local_cmd == Command::LOAD) {
                 try {
-                    model_->load_parameter(local_param_name, local_param);
+                    auto staged_param = weight_load_sync::stage(local_param, rank_info_.device);
+                    model_->load_parameter(local_param_name, staged_param);
                 } catch (const std::exception &e) {
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
@@ -369,7 +371,11 @@ void RankWorker::thread_loop() {
 
             } else if (local_cmd == Command::LOAD_BATCH) {
                 try {
-                    model_->load_parameters_no_sync(local_params, local_params_strict);
+                    auto staged_params = local_params;
+                    for (auto &[name, tensor] : staged_params) {
+                        tensor = weight_load_sync::stage(tensor, rank_info_.device);
+                    }
+                    model_->load_parameters_no_sync(staged_params, local_params_strict);
                     infinicore::context::syncStream();
                 } catch (const std::exception &e) {
                     {
@@ -439,8 +445,7 @@ void RankWorker::thread_loop() {
                         // not have a vocabulary dimension to sample from.
                         if (model_config_->get_or<bool>("skip_sampling", false)) {
                             auto output_ids = infinicore::Tensor::empty(
-                                {0}, infinicore::DataType::I64,
-                                infinicore::Device::cpu());
+                                {0}, infinicore::DataType::I64, rank_info_.device);
                             output_ = Output{output_ids, logits, hidden_states};
                             job_done_ = true;
                             cv_.notify_all();

@@ -1,9 +1,12 @@
 #include "qwen3_vl_for_conditional_generation.hpp"
 
 #include "../../global_state/global_state.hpp"
+
+#include <infinicore/context/context.hpp>"
 #include "../models_registry.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,17 +16,33 @@ namespace infinilm::models::qwen3_vl {
 namespace {
 
 std::vector<int64_t> tensor_to_i64_vector(const infinicore::Tensor &tensor) {
-    auto cpu = tensor->to(infinicore::Device::cpu());
-    std::vector<int64_t> values(cpu->numel());
-    if (cpu->dtype() == infinicore::DataType::I64) {
-        const auto *data = reinterpret_cast<const int64_t *>(cpu->data());
-        values.assign(data, data + cpu->numel());
+    if (!tensor->is_contiguous()) {
+        throw std::runtime_error(
+            "Qwen3VLModel: metadata tensors must be contiguous");
+    }
+    const size_t numel = tensor->numel();
+    std::vector<int64_t> values(numel);
+    if (tensor->dtype() == infinicore::DataType::I64) {
+        if (tensor->device().getType() == infinicore::Device::Type::CPU) {
+            std::memcpy(values.data(), tensor->data(), tensor->nbytes());
+        } else {
+            infinicore::context::setDevice(tensor->device());
+            infinicore::context::memcpyD2H(
+                values.data(), tensor->data(), tensor->nbytes());
+        }
         return values;
     }
-    if (cpu->dtype() == infinicore::DataType::I32) {
-        const auto *data = reinterpret_cast<const int32_t *>(cpu->data());
-        for (size_t i = 0; i < cpu->numel(); ++i) {
-            values[i] = static_cast<int64_t>(data[i]);
+    if (tensor->dtype() == infinicore::DataType::I32) {
+        std::vector<int32_t> raw(numel);
+        if (tensor->device().getType() == infinicore::Device::Type::CPU) {
+            std::memcpy(raw.data(), tensor->data(), tensor->nbytes());
+        } else {
+            infinicore::context::setDevice(tensor->device());
+            infinicore::context::memcpyD2H(
+                raw.data(), tensor->data(), tensor->nbytes());
+        }
+        for (size_t i = 0; i < numel; ++i) {
+            values[i] = static_cast<int64_t>(raw[i]);
         }
         return values;
     }

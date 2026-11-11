@@ -3,6 +3,8 @@
 #include "infinicore/ops/linear.hpp"
 #include "infinicore/ops/linear_allreduce.hpp"
 #include <optional>
+#include "../../models/minimax_h3/h3_projection_trace.hpp"
+namespace h3_projection = infinilm::models::minimax_h3::projection_trace;
 
 namespace infinilm::quantization {
 
@@ -29,6 +31,8 @@ infinicore::Tensor NoneQuantization::forward(
     bool has_bias,
     float alpha) const {
 
+    if (h3_projection::active && (has_bias || alpha != 1.0f))
+        throw std::runtime_error("projection trace requires no bias and alpha=1");
     auto input_contiguous = input->is_contiguous() ? input : input->contiguous();
     auto weight = params.at("weight");
 
@@ -40,9 +44,13 @@ infinicore::Tensor NoneQuantization::forward(
     // Ascend path: weight was pre-packed to [IC, OC] in process_weights_after_loading.
     // Use linear_packed to skip the runtime permute({1,0}).
     if (weight_prepacked_) {
-        return infinicore::op::linear_packed(input_contiguous, weight, bias_opt, alpha);
+        auto original = infinicore::op::linear_packed(input_contiguous, weight, bias_opt, alpha);
+        h3_projection::inspect_serial(weight, original);
+        return original;
     }
-    return infinicore::op::linear(input_contiguous->contiguous(), weight->contiguous(), bias_opt, alpha);
+    auto original = infinicore::op::linear(input_contiguous->contiguous(), weight->contiguous(), bias_opt, alpha);
+        h3_projection::inspect_serial(weight, original);
+        return original;
 }
 
 infinicore::Tensor NoneQuantization::forward_allreduce(
@@ -51,6 +59,8 @@ infinicore::Tensor NoneQuantization::forward_allreduce(
     bool has_bias,
     infinicclComm_t communicator,
     float alpha) const {
+    if (h3_projection::active && (has_bias || alpha != 1.0f))
+        throw std::runtime_error("projection trace requires no bias and alpha=1");
     if (alpha != 1.0f) {
         return BaseQuantization::forward_allreduce(
             params, input, has_bias, communicator, alpha);
@@ -65,12 +75,11 @@ infinicore::Tensor NoneQuantization::forward_allreduce(
         bias_opt = params.at("bias");
     }
 
-    if (weight_prepacked_) {
-        return infinicore::op::linear_allreduce_packed(
-            input_contiguous, weight, bias_opt, communicator);
-    }
-    return infinicore::op::linear_allreduce(
-        input_contiguous, weight->contiguous(), bias_opt, communicator);
+    auto original = weight_prepacked_
+        ? infinicore::op::linear_allreduce_packed(input_contiguous, weight, bias_opt, communicator)
+        : infinicore::op::linear_allreduce(input_contiguous, weight->contiguous(), bias_opt, communicator);
+    h3_projection::inspect_control(input_contiguous, weight, bias_opt, communicator, weight_prepacked_, original);
+    return original;
 }
 
 std::vector<SplitParam> NoneQuantization::split_params(

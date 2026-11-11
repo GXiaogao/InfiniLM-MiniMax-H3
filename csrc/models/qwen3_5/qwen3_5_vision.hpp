@@ -58,7 +58,8 @@ public:
 
     infinicore::Tensor forward(const infinicore::Tensor &hidden_states,
                                const infinicore::Tensor &row_position_ids,
-                               const infinicore::Tensor &col_position_ids) const;
+                               const infinicore::Tensor &col_position_ids,
+                               size_t tokens_per_frame) const;
 
 private:
     size_t hidden_size_;
@@ -93,7 +94,8 @@ public:
 
     infinicore::Tensor forward(const infinicore::Tensor &hidden_states,
                                const infinicore::Tensor &row_position_ids,
-                               const infinicore::Tensor &col_position_ids) const;
+                               const infinicore::Tensor &col_position_ids,
+                               size_t tokens_per_frame) const;
 
 private:
     INFINICORE_NN_MODULE(infinicore::nn::LayerNorm, norm1);

@@ -3,6 +3,7 @@
 #include "spdlog/spdlog.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -18,22 +19,26 @@ size_t max_length_from_offsets(
         return 0;
     }
 
-    auto cpu_offsets = offsets.value();
-    if (cpu_offsets->device().getType() != infinicore::Device::Type::CPU) {
-        cpu_offsets = cpu_offsets->to(infinicore::Device::cpu());
-        infinicore::context::syncStream();
-    }
-
-    if (cpu_offsets->dtype() != infinicore::DataType::I32
-        || cpu_offsets->shape().size() != 1
-        || cpu_offsets->shape()[0] < 2) {
+    const auto &offset_tensor = offsets.value();
+    if (offset_tensor->dtype() != infinicore::DataType::I32
+        || offset_tensor->shape().size() != 1
+        || offset_tensor->shape()[0] < 2
+        || !offset_tensor->is_contiguous()) {
         throw std::invalid_argument(
-            std::string(name) + " must be a one-dimensional int32 tensor with at least two entries");
+            std::string(name) + " must be a contiguous one-dimensional int32 tensor with at least two entries");
     }
 
-    const auto *values = reinterpret_cast<const int32_t *>(cpu_offsets->data());
+    std::vector<int32_t> values(offset_tensor->numel());
+    if (offset_tensor->device().getType() == infinicore::Device::Type::CPU) {
+        std::memcpy(values.data(), offset_tensor->data(), offset_tensor->nbytes());
+    } else {
+        infinicore::context::setDevice(offset_tensor->device());
+        infinicore::context::memcpyD2H(
+            values.data(), offset_tensor->data(), offset_tensor->nbytes());
+    }
+
     size_t max_length = 0;
-    for (size_t i = 1; i < cpu_offsets->shape()[0]; ++i) {
+    for (size_t i = 1; i < values.size(); ++i) {
         if (values[i] < values[i - 1]) {
             throw std::invalid_argument(std::string(name) + " must be nondecreasing");
         }

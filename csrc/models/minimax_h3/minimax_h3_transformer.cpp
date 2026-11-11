@@ -4,6 +4,7 @@
 #include "../models_registry.hpp"
 
 #include <infinicore/ops/add.hpp>
+#include <infinicore/ops/gated_residual.hpp>
 #include <infinicore/ops/cast.hpp>
 #include <infinicore/ops/distributed/allgather.hpp>
 #include <infinicore/ops/embedding.hpp>
@@ -17,17 +18,43 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
+#include "h3_boundary_trace.hpp"
+namespace infinilm::models::minimax_h3::boundary_trace {
+inline thread_local size_t condition_block = 0;
+inline void save_condition(const char *stage, const infinicore::Tensor &value) {
+    if (!enabled()) return;
+    const std::string name = "condition_" + std::to_string(condition_block) + "_" + stage;
+    save(name.c_str(), value);
+}
+} // namespace infinilm::models::minimax_h3::boundary_trace
+#include "h3_attention_trace.hpp"
+#include "h3_projection_trace.hpp"
 
 namespace infinilm::models::minimax_h3 {
 namespace {
 
 constexpr size_t H3_MODALITY_COUNT = 3;
+
+infinicore::Tensor gated_update(const infinicore::Tensor& residual,
+                               const infinicore::Tensor& gate,
+                               const infinicore::Tensor& branch) {
+    const char* setting = std::getenv("INFINILM_H3_NINETOOTHED_GATED");
+    const std::string mode = setting ? setting : "0";
+    if (mode == "1") {
+        return infinicore::op::gated_residual(residual, gate, branch);
+    }
+    if (mode != "0") {
+        throw std::invalid_argument("INFINILM_H3_NINETOOTHED_GATED must be 0 or 1");
+    }
+    return infinicore::op::add(residual, infinicore::op::mul(gate, branch));
+}
 
 infinicore::Tensor cast_to(const infinicore::Tensor &input,
                            const infinicore::DataType &dtype) {
@@ -121,8 +148,12 @@ infinicore::Tensor MiniMaxH3Attention::forward(
     const size_t batch_size = hidden_states->size(0);
     const size_t sequence_length = hidden_states->size(1);
 
+    attention_trace::save("input", hidden_states);
     auto hidden_states_mutable = hidden_states;
     auto [query, key, value] = qkv_proj_->forward_split(hidden_states_mutable);
+    attention_trace::save("q_raw", query);
+    attention_trace::save("k_raw", key);
+    attention_trace::save("v_raw", value);
     query = query->view({batch_size * sequence_length, num_heads_, head_dim_});
     key = key->view({batch_size * sequence_length, num_heads_, head_dim_});
     value = value->view({batch_size, sequence_length, num_heads_, head_dim_});
@@ -131,6 +162,8 @@ infinicore::Tensor MiniMaxH3Attention::forward(
     key = norm_k_->forward(key);
     query = query->view({batch_size, sequence_length, num_heads_, head_dim_});
     key = key->view({batch_size, sequence_length, num_heads_, head_dim_});
+    attention_trace::save("q_norm", query);
+    attention_trace::save("k_norm", key);
 
     if (rotary_cos_sin_cache.has_value()) {
         if (!position_ids.has_value()) {
@@ -176,7 +209,13 @@ infinicore::Tensor MiniMaxH3Attention::forward(
     }
     auto output = infinicore::op::mha(query, key, value, std::nullopt, scale_, false);
     output = output->view({batch_size, sequence_length, inner_dim_});
-    return linear_forward(out_proj_, output);
+    attention_trace::save("mha", output);
+    auto projected = [&]() {
+        projection_trace::Scope scope(attention_trace::active);
+        return linear_forward(out_proj_, output);
+    }();
+    attention_trace::save("projected", projected);
+    return projected;
 }
 
 void MiniMaxH3Attention::process_weights_after_loading() {
@@ -240,10 +279,22 @@ MiniMaxH3TokenRefinerBlock::MiniMaxH3TokenRefinerBlock(
 
 infinicore::Tensor MiniMaxH3TokenRefinerBlock::forward(
     const infinicore::Tensor &hidden_states) const {
-    auto attention_output = attn_->forward(norm1_->forward(hidden_states));
+    auto normalized1 = norm1_->forward(hidden_states);
+    boundary_trace::save_condition("norm1", normalized1);
+    auto attention_output = [&]() {
+        attention_trace::Scope scope(boundary_trace::condition_block == 0);
+        return attn_->forward(normalized1);
+    }();
+    boundary_trace::save_condition("attention_output", attention_output);
     auto output = infinicore::op::add(hidden_states, attention_output);
-    auto mlp_output = ff_->forward(norm2_->forward(output));
-    return infinicore::op::add(output, mlp_output);
+    boundary_trace::save_condition("after_attention", output);
+    auto normalized2 = norm2_->forward(output);
+    boundary_trace::save_condition("norm2", normalized2);
+    auto mlp_output = ff_->forward(normalized2);
+    boundary_trace::save_condition("mlp_output", mlp_output);
+    auto result = infinicore::op::add(output, mlp_output);
+    boundary_trace::save_condition("after_mlp", result);
+    return result;
 }
 
 MiniMaxH3TokenRefiner::MiniMaxH3TokenRefiner(
@@ -264,10 +315,16 @@ MiniMaxH3TokenRefiner::MiniMaxH3TokenRefiner(
 infinicore::Tensor
 MiniMaxH3TokenRefiner::forward(const infinicore::Tensor &hidden_states) const {
     auto output = hidden_states;
+    if (boundary_trace::enabled() && refiner_blocks_.size() != 2)
+        throw std::runtime_error("condition trace requires exactly two token refiner blocks");
+    size_t trace_block = 0;
     for (const auto &block : refiner_blocks_) {
+        boundary_trace::condition_block = trace_block++;
         output = block->forward(output);
     }
-    return final_norm_->forward(output);
+    auto result = final_norm_->forward(output);
+    boundary_trace::save("condition_final", result);
+    return result;
 }
 
 MiniMaxH3AdaLNProjection::MiniMaxH3AdaLNProjection(
@@ -324,7 +381,9 @@ infinicore::Tensor MiniMaxH3TransformerBlock::forward(
     const std::shared_ptr<infinicore::nn::RoPE> &rope,
     const infinicore::Tensor &position_ids,
     const std::optional<infinicore::Tensor> &rotary_cos_sin_cache) const {
-    auto modulation = adaln_proj_->forward(temb)->view(
+    auto modulation_raw = adaln_proj_->forward(temb);
+    boundary_trace::save("adaln_projection", modulation_raw);
+    auto modulation = modulation_raw->view(
         {temb->size(0) * H3_MODALITY_COUNT, 6 * hidden_size_});
     auto token_modulation = gather_rows(modulation, adaln_indices)->unsqueeze(0);
     auto shift_msa = token_modulation->narrow({{2, 0, hidden_size_}});
@@ -336,14 +395,19 @@ infinicore::Tensor MiniMaxH3TransformerBlock::forward(
 
     auto normalized = norm1_->forward(hidden_states);
     normalized = apply_adaln(normalized, scale_msa, shift_msa);
+    boundary_trace::save("attention_input", normalized);
     auto attention_output = attn_->forward(normalized, rope, position_ids, rotary_cos_sin_cache);
-    auto output = infinicore::op::add(
-        hidden_states, infinicore::op::mul(gate_msa, attention_output));
+    boundary_trace::save("attention_output", attention_output);
+    auto output = gated_update(hidden_states, gate_msa, attention_output);
+    boundary_trace::save("after_attention", output);
 
     normalized = norm2_->forward(output);
     normalized = apply_adaln(normalized, scale_mlp, shift_mlp);
+    boundary_trace::save("mlp_input", normalized);
     auto mlp_output = ff_->forward(normalized);
-    output = infinicore::op::add(output, infinicore::op::mul(gate_mlp, mlp_output));
+    boundary_trace::save("mlp_output", mlp_output);
+    output = gated_update(output, gate_mlp, mlp_output);
+    boundary_trace::save("after_mlp", output);
     return output;
 }
 
@@ -483,6 +547,8 @@ MiniMaxH3Transformer::MiniMaxH3Transformer(
 }
 
 InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
+    if (boundary_trace::enabled() && transformer_blocks_.size()!=1)
+        throw std::runtime_error("boundary trace supports only the isolated one-block diagnostic");
     require_tensor(input.video_hidden_states, "video_hidden_states");
     require_tensor(input.audio_hidden_states, "audio_hidden_states");
     require_tensor(input.encoder_hidden_states, "encoder_hidden_states");
@@ -524,7 +590,9 @@ InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
     auto text_input = cast_to(encoder_hidden_states, dtype_);
     auto video_embeds = cast_to(linear_forward(proj_in_, video_input), dtype_);
     auto audio_embeds = cast_to(linear_forward(audio_proj_in_, audio_input), dtype_);
+    boundary_trace::save("condition_input", text_input);
     auto context_embeds = linear_forward(context_embedder_, text_input);
+    boundary_trace::save("condition_projection", context_embeds);
     auto text_embeds = token_refiner_->forward(context_embeds);
 
     auto hidden_states = infinicore::Tensor::zeros(
@@ -536,7 +604,9 @@ InfinilmModel::Output MiniMaxH3Transformer::forward(const Input &input) const {
     hidden_states = infinicore::op::index_copy(
         hidden_states, 1, input.audio_indices.value(), audio_embeds);
 
+    boundary_trace::save("packed_hidden", hidden_states);
     auto temb = time_embedder_->forward(input.timestep.value());
+    boundary_trace::save("temb", temb);
     auto timestep_indices = input.timestep_indices.value();
     auto token_tags = input.token_tags.value();
     auto timestep_indices_x2 = infinicore::op::add(timestep_indices, timestep_indices);
